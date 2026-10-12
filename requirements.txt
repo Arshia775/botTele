@@ -1,1 +1,1 @@
-pyTelegramBotAPI
+pyTelegramBotAPI requests beautifulsoup4 lxml
