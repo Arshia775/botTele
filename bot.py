@@ -1,12 +1,11 @@
 import os
-import requests
+import asyncio
 import telebot
 from telebot import types
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------------
-# 🔐 توکن
+# 🔐 توکن ربات
 # ---------------------------------------------------------------
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
@@ -15,182 +14,201 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 BASE_URL = "https://gapfilm.ir"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    ),
-    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
-}
 
 # ===============================================================
-# 🕷️ تابع اصلی اسکرپینگ
+# 🕷️ اسکرپر با Playwright
 # ===============================================================
-def fetch_latest_content(limit: int = 6):
+async def scrape_gapfilm(limit: int = 8):
     """
-    صفحه اصلی gapfilm.ir را دریافت و جدیدترین فیلم/سریال‌ها را استخراج می‌کند.
-    خروجی: لیستی از دیکشنری‌ها با کلیدهای title, link, image, rating, type
+    با Playwright صفحه gapfilm.ir را باز می‌کند، صبر می‌کند
+    جاوااسکریپت اجرا شود، سپس لینک‌های فیلم و سریال را استخراج می‌کند.
     """
-    try:
-        resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"⚠️ خطا در دریافت صفحه: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    results = []
-    seen = set()  # جلوگیری از تکرار
-
-    # -----------------------------------------------------------
-    # 🎯 استخراج از اسلایدر اصلی (جدیدترین‌ها)
-    # هر آیتم شامل <a href="/movie/..."> یا <a href="/serial/...">
-    # -----------------------------------------------------------
-    for a_tag in soup.select('a[href*="/movie/"], a[href*="/serial/"]'):
-        href = a_tag.get("href", "")
-        if not href or href in seen:
-            continue
-
-        # استخراج عنوان از alt تصویر یا تگ h3
-        img = a_tag.find("img")
-        title = ""
-        image_url = ""
-
-        if img:
-            title = img.get("alt", "").strip()
-            image_url = (
-                img.get("src")
-                or img.get("data-src")
-                or ""
-            )
-
-        # اگر عنوان از alt نیامد، از h3 داخل لینک بخوان
-        if not title:
-            h3 = a_tag.find("h3")
-            if h3:
-                title = h3.get_text(strip=True)
-
-        if not title:
-            continue
-
-        seen.add(href)
-
-        # امتیاز IMDb (اختیاری)
-        rating = ""
-        rating_span = a_tag.find("span", class_=lambda c: c and "rait" in c)
-        if rating_span:
-            rating = rating_span.get_text(strip=True)
-
-        # نوع محتوا (فیلم/سریال)
-        content_type = "فیلم" if "/movie/" in href else "سریال"
-
-        full_link = urljoin(BASE_URL, href)
-
-        results.append({
-            "title": title,
-            "link": full_link,
-            "image": image_url,
-            "rating": rating,
-            "type": content_type,
-        })
-
-        if len(results) >= limit:
-            break
-
-    # اگر هیچ نتیجه‌ای از اسلایدر نیامد، از کارت‌های اصلی استفاده کن
-    if not results:
-        results = _fallback_scrape(soup, limit)
-
-    return results
-
-
-def _fallback_scrape(soup, limit):
-    """روش جایگزین: استخراج از کارت‌های بخش‌های اصلی."""
     results = []
     seen = set()
 
-    # کارت‌های محتوایی که معمولاً در section های اصلی هستند
-    for card in soup.select('div.next-1xa9zkv, div.next-1hygfzp, div.next-xdq8fq'):
-        parent_a = card.find_parent("a", href=True)
-        if not parent_a:
-            continue
+    async with async_playwright() as p:
+        # اجرای مرورگر به صورت Headless
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
 
-        href = parent_a["href"]
-        if href in seen:
-            continue
-        seen.add(href)
+        context = await browser.new_context(
+            locale="fa-IR",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+        )
 
-        img = card.find("img")
-        title = img.get("alt", "").strip() if img else ""
-        image_url = ""
-        if img:
-            image_url = img.get("src") or img.get("data-src") or ""
+        page = await context.new_page()
 
-        if not title:
-            h3 = parent_a.find("h3")
-            if h3:
-                title = h3.get_text(strip=True)
+        # مسدود کردن منابع غیرضروری برای سرعت بیشتر
+        await page.route(
+            "**/*",
+            lambda route: asyncio.create_task(_block_resources(route)),
+        )
 
-        if not title:
-            continue
+        try:
+            # باز کردن سایت
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
 
-        rating = ""
-        rating_span = parent_a.find("span", class_=lambda c: c and "rait" in c)
-        if rating_span:
-            rating = rating_span.get_text(strip=True)
+            # صبر برای بارگذاری کارت‌های محتوا
+            try:
+                await page.wait_for_selector(
+                    'a[href*="/movie/"], a[href*="/serial/"]',
+                    timeout=20000,
+                )
+            except Exception:
+                pass
 
-        content_type = "فیلم" if "/movie/" in href else "سریال"
-        full_link = urljoin(BASE_URL, href)
+            # کمی اسکرول برای بارگذاری Lazy Loading
+            for _ in range(3):
+                await page.mouse.wheel(0, 1500)
+                await asyncio.sleep(1)
 
-        results.append({
-            "title": title,
-            "link": full_link,
-            "image": image_url,
-            "rating": rating,
-            "type": content_type,
-        })
+            # استخراج داده‌ها
+            items = await page.evaluate("""
+                () => {
+                    const results = [];
+                    const anchors = document.querySelectorAll(
+                        'a[href*="/movie/"], a[href*="/serial/"]'
+                    );
+                    for (const a of anchors) {
+                        const href = a.getAttribute('href') || '';
+                        if (!href) continue;
 
-        if len(results) >= limit:
-            break
+                        let title = '';
+                        let image = '';
 
-    return results
+                        const img = a.querySelector('img');
+                        if (img) {
+                            title = (img.getAttribute('alt') || '').trim();
+                            image = img.getAttribute('src')
+                                 || img.getAttribute('data-src')
+                                 || '';
+                            // اگر src نسبی است، کاملش کن
+                            if (image && !image.startsWith('http')) {
+                                image = 'https://gapfilm.ir' + image;
+                            }
+                        }
+
+                        if (!title) {
+                            const h3 = a.querySelector('h3');
+                            if (h3) title = h3.innerText.trim();
+                        }
+
+                        if (!title) continue;
+
+                        // امتیاز IMDb
+                        let rating = '';
+                        const ratingEl = a.querySelector('span.rait, .next-go0nwv .rait');
+                        if (ratingEl) {
+                            rating = ratingEl.innerText.trim();
+                        }
+
+                        results.push({
+                            title: title,
+                            link: href.startsWith('http')
+                                  ? href
+                                  : 'https://gapfilm.ir' + href,
+                            image: image,
+                            rating: rating,
+                        });
+                    }
+                    return results;
+                }
+            """)
+
+            # حذف تکراری‌ها و نگه‌داشتن ترتیب
+            for it in items:
+                if it["link"] in seen:
+                    continue
+                seen.add(it["link"])
+
+                content_type = "سریال" if "/serial/" in it["link"] else "فیلم"
+                it["type"] = content_type
+                results.append(it)
+
+                if len(results) >= limit * 2:
+                    break
+
+        finally:
+            await browser.close()
+
+    return results[:limit]
+
+
+async def _block_resources(route):
+    """مسدود کردن تصاویر بزرگ، فونت‌ها و آنالیتیکس برای سرعت."""
+    try:
+        req = route.request
+        rtype = req.resource_type
+        url = req.url.lower()
+
+        # اجازه دسترسی به تصاویر کوچک برای پوستر فیلم‌ها
+        if rtype in ("font", "media", "stylesheet"):
+            return await route.abort()
+
+        # مسدود کردن اسکریپت‌های تبلیغاتی/آنالیتیکس
+        blocked = ("google-analytics", "googletagmanager", "doubleclick",
+                   "yandex", "facebook", "hotjar", "clarity")
+        if any(b in url for b in blocked):
+            return await route.abort()
+
+        await route.continue_()
+    except Exception:
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
+
+def scrape_sync(limit=8):
+    """Wrapper برای فراخوانی async از کد sync تلگرام."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(scrape_gapfilm(limit))
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 # ===============================================================
-# 📤 ارسال نتایج به تلگرام
+# 📤 ارسال محتوا به تلگرام
 # ===============================================================
-def send_content_list(chat_id, items, header="🎬 **جدیدترین‌های گپ فیلم**"):
-    """لیست آیتم‌ها را با تصویر و دکمه شیشه‌ای ارسال می‌کند."""
+def send_content_list(chat_id, items, header):
     if not items:
         bot.send_message(
             chat_id,
-            "😔 متأسفانه در حال حاضر محتوایی از سایت دریافت نشد.\n"
-            "لطفاً بعداً دوباره امتحان کنید.",
+            "😔 متأسفانه محتوایی از سایت دریافت نشد.\n"
+            "لطفاً چند لحظه بعد دوباره امتحان کنید.",
         )
         return
 
     bot.send_message(chat_id, header, parse_mode="Markdown")
 
     for item in items:
-        caption = (
-            f"🎬 **{item['title']}**\n"
-            f"📌 نوع: {item['type']}\n"
-        )
-        if item["rating"]:
-            caption += f"⭐ امتیاز IMDb: {item['rating']}\n"
+        caption = f"🎬 **{item['title']}**\n📌 نوع: {item['type']}\n"
+        if item.get("rating"):
+            caption += f"⭐ IMDb: {item['rating']}\n"
 
-        # دکمه شیشه‌ای برای مشاهده در سایت
         kb = types.InlineKeyboardMarkup()
-        kb.add(
-            types.InlineKeyboardButton(
-                text="▶️ مشاهده در گپ فیلم",
-                url=item["link"],
-            )
-        )
+        kb.add(types.InlineKeyboardButton(
+            text="▶️ مشاهده در گپ فیلم",
+            url=item["link"],
+        ))
 
-        # اگر تصویر داشت، با عکس بفرست؛ وگرنه فقط متن + دکمه
-        if item["image"] and item["image"].startswith("http"):
+        if item.get("image", "").startswith("http"):
             try:
                 bot.send_photo(
                     chat_id,
@@ -199,27 +217,21 @@ def send_content_list(chat_id, items, header="🎬 **جدیدترین‌های �
                     reply_markup=kb,
                     parse_mode="Markdown",
                 )
+                continue
             except Exception as e:
-                print(f"⚠️ خطا در ارسال عکس {item['title']}: {e}")
-                bot.send_message(
-                    chat_id,
-                    caption,
-                    reply_markup=kb,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-        else:
-            bot.send_message(
-                chat_id,
-                caption,
-                reply_markup=kb,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
+                print(f"⚠️ ارسال عکس ناموفق: {e}")
+
+        bot.send_message(
+            chat_id,
+            caption,
+            reply_markup=kb,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
 
 
 # ===============================================================
-# 🎛️ منوی اصلی ربات
+# 🎛️ منوی اصلی
 # ===============================================================
 def main_menu():
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -228,7 +240,7 @@ def main_menu():
         types.InlineKeyboardButton("📺 جدیدترین سریال‌ها", callback_data="new_series"),
     )
     kb.row(
-        types.InlineKeyboardButton("🔥 برترین‌ها", callback_data="top_rated"),
+        types.InlineKeyboardButton("🔥 همه جدیدترین‌ها", callback_data="new_all"),
         types.InlineKeyboardButton("🔍 جستجو در سایت", url=f"{BASE_URL}/search/"),
     )
     kb.row(
@@ -239,7 +251,7 @@ def main_menu():
 
 
 # ===============================================================
-# 🚀 دستور /start
+# 🚀 دستورات
 # ===============================================================
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -247,7 +259,7 @@ def cmd_start(message):
     text = (
         f"👋 سلام **{name}** عزیز!\n\n"
         "🎬 به ربات داینامیک **گپ فیلم** خوش آمدید!\n"
-        "با هر بار کلیک، جدیدترین محتوای سایت به‌صورت زنده دریافت می‌شود.\n\n"
+        "با هر کلیک، جدیدترین محتوای سایت به‌صورت زنده دریافت می‌شود.\n\n"
         "👇 یک گزینه را انتخاب کنید:"
     )
     bot.send_message(
@@ -259,50 +271,40 @@ def cmd_start(message):
     )
 
 
+@bot.message_handler(commands=["new"])
+def cmd_new(message):
+    bot.send_message(message.chat.id, "🔄 در حال دریافت جدیدترین‌ها از گپ فیلم...")
+    items = scrape_sync(limit=8)
+    send_content_list(message.chat.id, items, "🎬 **جدیدترین‌های گپ فیلم**")
+
+
 # ===============================================================
-# 🔄 مدیریت دکمه‌های شیشه‌ای
+# 🔄 Callback ها
 # ===============================================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     chat_id = call.message.chat.id
     data = call.data
 
-    bot.answer_callback_query(call.id, "⏳ در حال دریافت اطلاعات از سایت...")
+    bot.answer_callback_query(call.id, "⏳ در حال دریافت از سایت...")
+    bot.send_message(chat_id, "🔄 در حال دریافت اطلاعات از گپ فیلم...\n(چند ثانیه صبر کنید)")
+
+    items = scrape_sync(limit=10)
 
     if data == "new_movies":
-        bot.send_message(chat_id, "🔄 در حال دریافت جدیدترین فیلم‌ها از گپ فیلم...")
-        items = fetch_latest_content(limit=6)
         movies = [i for i in items if i["type"] == "فیلم"]
-
-        if not movies:
-            movies = items  # اگر همه سریال بودند، همان‌ها را نشان بده
-
-        send_content_list(chat_id, movies, "🎬 **جدیدترین فیلم‌های گپ فیلم**")
+        send_content_list(chat_id, movies[:6], "🎬 **جدیدترین فیلم‌های گپ فیلم**")
 
     elif data == "new_series":
-        bot.send_message(chat_id, "🔄 در حال دریافت جدیدترین سریال‌ها از گپ فیلم...")
-        items = fetch_latest_content(limit=8)
         series = [i for i in items if i["type"] == "سریال"]
+        send_content_list(chat_id, series[:6], "📺 **جدیدترین سریال‌های گپ فیلم**")
 
-        if not series:
-            series = items
-
-        send_content_list(chat_id, series, "📺 **جدیدترین سریال‌های گپ فیلم**")
-
-    elif data == "top_rated":
-        bot.send_message(chat_id, "🔄 در حال دریافت برترین‌ها...")
-        items = fetch_latest_content(limit=8)
-        # مرتب‌سازی بر اساس امتیاز IMDb
-        items = sorted(
-            [i for i in items if i["rating"]],
-            key=lambda x: float(x["rating"]) if x["rating"].replace(".", "").isdigit() else 0,
-            reverse=True,
-        )
-        send_content_list(chat_id, items[:6], "🔥 **برترین‌های گپ فیلم (بر اساس IMDb)**")
+    elif data == "new_all":
+        send_content_list(chat_id, items[:8], "🔥 **جدیدترین‌های گپ فیلم**")
 
 
 # ===============================================================
-# 💬 پیام‌های متنی
+# 💬 پیام متنی
 # ===============================================================
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
@@ -317,5 +319,5 @@ def fallback(message):
 # ▶️ اجرا
 # ===============================================================
 if __name__ == "__main__":
-    print("🤖 ربات داینامیک گپ فیلم روشن شد...")
+    print("🤖 ربات داینامیک گپ فیلم (Playwright) روشن شد...")
     bot.infinity_polling()
