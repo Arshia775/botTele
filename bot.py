@@ -1,210 +1,86 @@
 import os
-import random
-import logging
-
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from bs4 import BeautifulSoup
 import telebot
-from telebot import types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ── لاگ ───────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+BOT_TOKEN = "9048554432:AAGLng2a3paZaj_X7kiuwN0FAhdDw71214o"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# 🔐 توکن ربات
-# ---------------------------------------------------------------
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("❌ توکن ربات تنظیم نشده است!")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
-bot = telebot.TeleBot(TOKEN)
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Scraper Bot is running!")
 
-# ── ثابت‌ها ───────────────────────────────────────────────
-URL = "https://arzdigital.com/currencies/united-states-dollar/"
+def run_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
-PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
-LATIN_DIGITS = "0123456789"
-DIGIT_MAP = str.maketrans(PERSIAN_DIGITS, LATIN_DIGITS)
-
-# ── ذخیره وضعیت کاربران ───────────────────────────────────
-# ساختار: { user_id: {"state": "captcha" | "menu", "answer": int} }
-user_states: dict[int, dict] = {}
-
-
-# ── تبدیل اعداد فارسی به لاتین ────────────────────────────
-def persian_to_latin(text: str) -> str:
-    """تبدیل ارقام فارسی به لاتین"""
-    return text.translate(DIGIT_MAP)
-
-
-# ── دریافت قیمت دلار از ارزدیجیتال ────────────────────────
-def get_dollar_price() -> str | None:
-    """
-    استخراج قیمت لحظه‌ای دلار به تومان از سایت ارزدیجیتال
-    تگ هدف:
-        <span class="arz-irt-price" dir="rtl">
-            <span>۲۶۳,۲۰۰</span>
-            <span class="arz-irt-symbol"></span>
-        </span>
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
-    }
-
+@bot.message_handler(commands=['start', 'new'])
+def get_latest_movies(message):
+    msg = bot.reply_to(message, "در حال دریافت لیست جدیدترین فیلم‌ها از سایت...")
     try:
-        response = requests.get(URL, headers=headers, timeout=15)
-        response.raise_for_status()
-        response.encoding = "utf-8"
+        response = requests.get("https://www.uptvs.com/", headers=HEADERS, timeout=15)
+        if response.status_code != 200:
+            bot.edit_message_text(f"خطا در اتصال به سایت (کد وضعیت: {response.status_code}). احتمالاً آی‌پی سرور مسدود است.", message.chat.id, msg.message_id)
+            return
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(response.text, 'html.parser')
+        markup = InlineKeyboardMarkup()
+        
+        # پیدا کردن لینک پست‌ها (تگ‌ها بسته به قالب سایت تنظیم می‌شوند)
+        articles = soup.find_all('article', limit=8)
+        count = 0
+        for article in articles:
+            link_tag = article.find('a', href=True)
+            if link_tag and link_tag.get('title'):
+                title = link_tag.get('title').strip()
+                url = link_tag['href']
+                # ارسال لینک صفحه به عنوان داده دکمه
+                markup.add(InlineKeyboardButton(text=title[:40], callback_data=f"dl|{url[:55]}"))
+                count += 1
 
-        # سلکتور اصلی
-        price_tag = soup.select_one("span.arz-irt-price > span:first-child")
+        if count == 0:
+            bot.edit_message_text("فیلمی پیدا نشد. نیاز به تنظیم دقیق‌تر تگ‌های HTML سایت است.", message.chat.id, msg.message_id)
+        else:
+            bot.edit_message_text("جدیدترین فیلم‌های سایت (برای دریافت لینک کلیک کنید):", message.chat.id, msg.message_id, reply_markup=markup)
 
-        # سلکتور جایگزین در صورت تغییر ساختار
-        if not price_tag:
-            price_tag = soup.select_one(
-                ".arz-coin-page-data__coin-toman-price span.arz-irt-price span"
-            )
+    except Exception as e:
+        bot.edit_message_text(f"خطا در ارتباط با سایت:\n{str(e)[:100]}", message.chat.id, msg.message_id)
 
-        if not price_tag:
-            return None
+@bot.callback_query_handler(func=lambda call: call.data.startswith("dl|"))
+def fetch_download_links(call):
+    page_url = call.data.split("|", 1)[1]
+    bot.answer_callback_query(call.id, "در حال استخراج لینک‌های دانلود...")
+    
+    try:
+        res = requests.get(page_url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # پیدا کردن تمام لینک‌هایی که پسوند ویدیو دارند (mp4 یا mkv)
+        links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.endswith(('.mkv', '.mp4')):
+                quality_text = a.get_text(strip=True) or "لینک دانلود"
+                links.append(f"🎬 <a href='{href}'>{quality_text}</a>")
 
-        raw_price = price_tag.get_text(strip=True)      # مثال: ۲۶۳,۲۰۰
-        latin_price = persian_to_latin(raw_price)       # مثال: 263,200
-        numeric_price = latin_price.replace(",", "")    # مثال: 263200
+        if links:
+            result_text = "لینک‌های مستقیم دانلود:\n\n" + "\n".join(links[:6])
+            bot.send_message(call.message.chat.id, result_text, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            bot.send_message(call.message.chat.id, f"لینک مستقیمی در صفحه پیدا نشد. صفحه فیلم:\n{page_url}")
+    except Exception as e:
+        bot.send_message(call.message.chat.id, f"خطا در دریافت صفحه فیلم: {str(e)[:100]}")
 
-        return numeric_price
-
-    except requests.RequestException as e:
-        logger.error(f"خطا در دریافت قیمت: {e}")
-        return None
-
-
-# ── دستور /start و کپچا ───────────────────────────────────
-@bot.message_handler(commands=["start"])
-def cmd_start(message: types.Message):
-    """ارسال کپچای ریاضی ساده"""
-    a = random.randint(1, 15)
-    b = random.randint(1, 15)
-    answer = a + b
-
-    user_states[message.chat.id] = {"state": "captcha", "answer": answer}
-
-    bot.send_message(
-        message.chat.id,
-        f"🤖 برای اطمینان از اینکه ربات نیستید، لطفاً پاسخ عبارت زیر را ارسال کنید:\n\n"
-        f"➖➖➖➖➖➖➖➖\n"
-        f"   {a}  +  {b}  =  ?\n"
-        f"➖➖➖➖➖➖➖➖\n\n"
-        f"فقط عدد پاسخ را بفرستید.",
-        reply_markup=types.ReplyKeyboardRemove(),
-    )
-
-
-# ── دستور /price (قیمت لحظه‌ای) ────────────────────────────
-@bot.message_handler(commands=["price"])
-def cmd_price(message: types.Message):
-    state = user_states.get(message.chat.id, {}).get("state")
-
-    if state != "menu":
-        bot.send_message(
-            message.chat.id,
-            "⚠️ ابتدا باید کپچا را حل کنید.\nبرای شروع /start را بزنید.",
-        )
-        return
-
-    bot.send_message(message.chat.id, "⏳ در حال دریافت قیمت از ارزدیجیتال...")
-
-    price = get_dollar_price()
-
-    if price is None:
-        bot.send_message(
-            message.chat.id,
-            "❌ متأسفانه در دریافت قیمت خطایی رخ داد.\n"
-            "لطفاً چند لحظه بعد دوباره تلاش کنید.",
-        )
-        return
-
-    formatted = f"{int(price):,}"
-
-    bot.send_message(
-        message.chat.id,
-        f"💵 <b>قیمت لحظه‌ای دلار (بازار آزاد)</b>\n\n"
-        f"💰 <code>{formatted}</code> تومان\n\n"
-        f"🔗 منبع: arzdigital.com",
-        parse_mode="HTML",
-    )
-
-
-# ── دستور /cancel ─────────────────────────────────────────
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message: types.Message):
-    user_states.pop(message.chat.id, None)
-    bot.send_message(
-        message.chat.id,
-        "مکالمه لغو شد. برای شروع مجدد /start را بزنید.",
-        reply_markup=types.ReplyKeyboardRemove(),
-    )
-
-
-# ── هندلر عمومی متن (مدیریت کپچا) ─────────────────────────
-@bot.message_handler(
-    func=lambda msg: msg.chat.id in user_states
-    and user_states[msg.chat.id].get("state") == "captcha",
-    content_types=["text"],
-)
-def handle_captcha(message: types.Message):
-    text = message.text.strip()
-
-    if not text.isdigit():
-        bot.send_message(message.chat.id, "⚠️ لطفاً فقط عدد ارسال کنید.")
-        return
-
-    correct = user_states[message.chat.id].get("answer")
-
-    if int(text) == correct:
-        user_states[message.chat.id] = {"state": "menu"}
-        bot.send_message(
-            message.chat.id,
-            "✅ تایید شد! خوش آمدید.\n\n"
-            "برای دریافت قیمت لحظه‌ای دلار دستور /price را ارسال کنید.",
-        )
-    else:
-        user_states.pop(message.chat.id, None)
-        bot.send_message(
-            message.chat.id,
-            "❌ پاسخ اشتباه است. لطفاً دوباره تلاش کنید.\n"
-            "برای دریافت کپچای جدید /start را بزنید.",
-        )
-
-
-# ── هندلر پیش‌فرض پیام‌های متفرقه ──────────────────────────
-@bot.message_handler(content_types=["text"])
-def fallback(message: types.Message):
-    state = user_states.get(message.chat.id, {}).get("state")
-
-    if state == "menu":
-        bot.send_message(
-            message.chat.id,
-            "برای دریافت قیمت لحظه‌ای دلار دستور /price را ارسال کنید.",
-        )
-    else:
-        bot.send_message(
-            message.chat.id,
-            "برای شروع /start را بزنید.",
-        )
-
-
-# ── اجرا ──────────────────────────────────────────────────
 if __name__ == "__main__":
-    logger.info("🤖 ربات در حال اجراست...")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    bot.infinity_polling()
